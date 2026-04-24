@@ -1,0 +1,29 @@
+{
+  "name": "toy-agent",
+  "type": "module",
+  "version": "1.0.0",
+  "packageManager": "pnpm@10.26.1",
+  "description": "",
+  "author": "",
+  "license": "ISC",
+  "keywords": [],
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.53",
+    "ai": "^6.0.168",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^8.2.0",
+    "@types/node": "^25.6.0",
+    "eslint": "^10.2.0",
+    "eslint-plugin-format": "^2.0.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}
