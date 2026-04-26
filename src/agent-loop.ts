@@ -4,10 +4,10 @@ import { streamText } from 'ai'
 import { detect, recordCall, recordResult, resetHistory } from './loop-detection'
 
 const MAX_STEPS = 15
-resetHistory()
 
 export async function agentLoop(model: any, tools: any, messages: ModelMessage[], system: string) {
   let step = 0
+  resetHistory()
 
   while (step < MAX_STEPS) {
     step++
