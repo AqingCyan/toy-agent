@@ -5,5 +5,6 @@ export default antfu({
   rules: {
     'no-console': 'off',
     'no-new-func': 'off',
+    'no-case-declarations': 'off',
   },
 })
