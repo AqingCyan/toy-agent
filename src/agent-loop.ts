@@ -6,6 +6,7 @@ import { calculateDelay, isRetryable, sleep } from './retry.js'
 
 const MAX_STEPS = 15
 const MAX_RETRIES = 3
+const TOKEN_BUDGET = 15000
 
 export async function agentLoop(
   model: any,
@@ -14,6 +15,8 @@ export async function agentLoop(
   system: string,
 ) {
   let step = 0
+  let totalTokens = 0
+
   resetHistory()
 
   while (step < MAX_STEPS) {
@@ -25,6 +28,7 @@ export async function agentLoop(
     let shouldBreak = false
     let lastToolCall: { name: string, input: unknown } | null = null
     let stepResponse: Awaited<ReturnType<typeof streamText>['response']>
+    let stepUsage: Awaited<ReturnType<typeof streamText>['usage']>
 
     // 步骤级重试：包裹整个 stream 消费过程
     for (let attempt = 1; ; attempt++) {
@@ -69,6 +73,7 @@ export async function agentLoop(
         }
 
         stepResponse = await result.response
+        stepUsage = await result.usage
         break
       }
       catch (error) {
@@ -90,7 +95,18 @@ export async function agentLoop(
       break
     }
 
-    messages.push(...stepResponse!.messages)
+    messages.push(...stepResponse.messages)
+
+    // Token 预算追踪
+    const inp = stepUsage?.inputTokens ?? 0
+    const out = stepUsage?.outputTokens ?? 0
+    totalTokens += inp + out
+    const pct = Math.round(totalTokens / TOKEN_BUDGET * 100)
+    console.log(`  [Token] ${totalTokens}/${TOKEN_BUDGET} (${pct}%)`)
+    if (totalTokens > TOKEN_BUDGET) {
+      console.log('\n[Token 预算耗尽，强制停止]')
+      break
+    }
 
     // 退出条件：模型没有调用任何工具，说明它认为可以直接回复了
     if (!hasToolCall) {
