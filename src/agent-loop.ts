@@ -1,4 +1,5 @@
 import type { ModelMessage } from 'ai'
+import type { ToolRegistry } from './tool-registry.js'
 import process from 'node:process'
 import { streamText } from 'ai'
 import { detect, recordCall, recordResult, resetHistory } from './loop-detection.js'
@@ -10,7 +11,8 @@ const TOKEN_BUDGET = 15000
 
 export async function agentLoop(
   model: any,
-  tools: any,
+  // 传入工具注册表，而不是裸 tools 对象；注册表负责统一转换格式、控制并发和裁剪结果。
+  registry: ToolRegistry,
   messages: ModelMessage[],
   system: string,
 ) {
@@ -33,7 +35,15 @@ export async function agentLoop(
     // 步骤级重试：包裹整个 stream 消费过程
     for (let attempt = 1; ; attempt++) {
       try {
-        const result = streamText({ model, system, tools, messages, maxRetries: 0, onError: () => {} })
+        const result = streamText({
+          model,
+          system,
+          // 每轮调用前从注册表生成 AI SDK 工具格式，工具执行会先经过注册表的包装层。
+          tools: registry.toAISDKFormat(),
+          messages,
+          maxRetries: 0,
+          onError: () => {},
+        })
 
         for await (const part of result.fullStream) {
           switch (part.type) {
@@ -56,7 +66,7 @@ export async function agentLoop(
                 else {
                   messages.push({
                     role: 'user' as const,
-                    content: `[系统提醒] ${detection.message}。请换一个思路解决问题，不要重复同样的操作。`,
+                    content: `  [系统提醒] ${detection.message}。请换一个思路解决问题，不要重复同样的操作。`,
                   })
                 }
               }
@@ -91,7 +101,7 @@ export async function agentLoop(
     }
 
     if (shouldBreak) {
-      console.log('\n[循环检测触发，Agent 已停止]')
+      console.log('\n  [循环检测触发，Agent 已停止]')
       break
     }
 
@@ -104,7 +114,7 @@ export async function agentLoop(
     const pct = Math.round(totalTokens / TOKEN_BUDGET * 100)
     console.log(`  [Token] ${totalTokens}/${TOKEN_BUDGET} (${pct}%)`)
     if (totalTokens > TOKEN_BUDGET) {
-      console.log('\n[Token 预算耗尽，强制停止]')
+      console.log('\n  [Token 预算耗尽，强制停止]')
       break
     }
 
@@ -120,6 +130,6 @@ export async function agentLoop(
   }
 
   if (step >= MAX_STEPS) {
-    console.log('\n[达到最大步数限制，强制停止]')
+    console.log('\n  [达到最大步数限制，强制停止]')
   }
 }

@@ -252,18 +252,18 @@ export function detect(toolName: string, params: unknown): DetectionResult {
 
   const pingPong = getPingPongCount(argsHash)
   if (pingPong >= CRITICAL_THRESHOLD) {
-    return { stuck: true, level: 'critical', detector: 'ping_pong', count: pingPong, message: `[熔断] 检测到乒乓循环（${pingPong} 次交替），强制停止` }
+    return { stuck: true, level: 'critical', detector: 'ping_pong', count: pingPong, message: `  [熔断] 检测到乒乓循环（${pingPong} 次交替），强制停止` }
   }
   if (pingPong >= WARNING_THRESHOLD) {
-    return { stuck: true, level: 'warning', detector: 'ping_pong', count: pingPong, message: `[警告] 检测到乒乓循环（${pingPong} 次交替），建议换个思路` }
+    return { stuck: true, level: 'warning', detector: 'ping_pong', count: pingPong, message: `  [警告] 检测到乒乓循环（${pingPong} 次交替），建议换个思路` }
   }
 
   const recentCount = history.filter(h => h.toolName === toolName && h.argsHash === argsHash).length
   if (recentCount >= CRITICAL_THRESHOLD) {
-    return { stuck: true, level: 'critical', detector: 'generic_repeat', count: recentCount, message: `[熔断] ${toolName} 相同参数已调用 ${recentCount} 次，强制停止` }
+    return { stuck: true, level: 'critical', detector: 'generic_repeat', count: recentCount, message: `  [熔断] ${toolName} 相同参数已调用 ${recentCount} 次，强制停止` }
   }
   if (recentCount >= WARNING_THRESHOLD) {
-    return { stuck: true, level: 'warning', detector: 'generic_repeat', count: recentCount, message: `[警告] ${toolName} 相同参数已调用 ${recentCount} 次，你可能陷入了重复` }
+    return { stuck: true, level: 'warning', detector: 'generic_repeat', count: recentCount, message: `  [警告] ${toolName} 相同参数已调用 ${recentCount} 次，你可能陷入了重复` }
   }
 
   return { stuck: false }
