@@ -1,6 +1,7 @@
 import type { ToolDefinition } from './tool-registry.js'
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import fg from 'fast-glob'
 
 export const weatherTool: ToolDefinition = {
   name: 'get_weather',
@@ -148,6 +149,36 @@ export const editFileTool: ToolDefinition = {
   },
 }
 
+export const globTool: ToolDefinition = {
+  name: 'glob',
+  description: '按模式搜索文件。支持 * 和 ** 通配符，如 "src/**/*.ts" 匹配 src 下所有 TypeScript 文件',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: '搜索模式，如 "**/*.ts"、"src/*.json"' },
+      path: { type: 'string', description: '搜索起始目录，默认当前目录' },
+    },
+    required: ['pattern'],
+    additionalProperties: false,
+  },
+  isConcurrencySafe: true,
+  isReadOnly: true,
+  execute: async ({ pattern, path = '.' }: { pattern: string, path?: string }) => {
+    // 从 resolve(path) 指定的目录开始搜索，只找普通文件，跳过 node_modules 和 .git，默认不包含隐藏文件，也不跟随符号链接
+    const results = await fg(pattern, {
+      cwd: resolve(path),
+      ignore: ['node_modules/**', '.git/**'],
+      dot: false,
+      onlyFiles: true,
+      followSymbolicLinks: false,
+    })
+    if (results.length === 0) {
+      return `没有找到匹配 "${pattern}" 的文件`
+    }
+    return results.sort().join('\n')
+  },
+}
+
 export const allTools: ToolDefinition[] = [
   weatherTool,
   calculatorTool,
@@ -155,4 +186,5 @@ export const allTools: ToolDefinition[] = [
   writeFileTool,
   listDirectoryTool,
   editFileTool,
+  globTool,
 ]
