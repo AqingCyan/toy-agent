@@ -42,7 +42,9 @@ export async function agentLoop(
           tools: registry.toAISDKFormat(),
           messages,
           maxRetries: 0,
-          onError: () => {},
+          onError: ({ error }) => {
+            console.error('\n  [AI 流错误]', error)
+          },
         })
 
         for await (const part of result.fullStream) {
