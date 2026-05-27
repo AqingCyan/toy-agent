@@ -7,7 +7,7 @@ import { calculateDelay, isRetryable, sleep } from './retry.js'
 
 const MAX_STEPS = 15
 const MAX_RETRIES = 3
-const TOKEN_BUDGET = 15000
+const TOKEN_BUDGET = 50000
 
 export async function agentLoop(
   model: any,

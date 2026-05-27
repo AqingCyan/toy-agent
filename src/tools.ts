@@ -1,11 +1,11 @@
 import type { Server } from 'node:http'
-import type { ToolDefinition } from './tool-registry.js'
+import type { ToolDefinition } from './tool-registry'
 import { execSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { dirname, extname, join, relative, resolve } from 'node:path'
-
 import fg from 'fast-glob'
+import { pickSearchTool, webFetchTool } from './search-tools'
 
 export const weatherTool: ToolDefinition = {
   name: 'get_weather',
@@ -454,4 +454,6 @@ export const allTools: ToolDefinition[] = [
   bashTool,
   fetchUrlTool,
   startPreviewTool,
+  pickSearchTool(),
+  webFetchTool,
 ]
