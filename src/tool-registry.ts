@@ -1,3 +1,4 @@
+import type { MCPClient } from './mcp-client'
 import { jsonSchema } from 'ai'
 
 // 单个工具的统一定义。这里既描述给模型看的能力，也保留运行时元数据。
@@ -18,6 +19,7 @@ const DEFAULT_MAX_RESULT_CHARS = 3000
 export class ToolRegistry {
   // 以工具名为 key，方便注册覆盖和按名查找。
   private tools = new Map<string, ToolDefinition>()
+  private mcpClients: Array<MCPClient> = []
 
   // 简单的读写锁状态：串行工具会持有独占锁；可并发工具会增加共享计数。
   private exclusiveLock = false
@@ -30,6 +32,50 @@ export class ToolRegistry {
     for (const tool of tools) {
       this.tools.set(tool.name, tool)
     }
+  }
+
+  // 注册 MCP server 的工具，给每个工具加上前缀，避免与本地工具冲突。
+  async registerMCPServer(serverName: string, client: MCPClient): Promise<string[]> {
+    await client.connect()
+    this.mcpClients.push(client)
+
+    const tools = await client.listTools()
+    const registered: string[] = []
+
+    for (const tool of tools) {
+      const prefixedName = `mcp__${serverName}__${tool.name}`
+      if (this.tools.has(prefixedName)) {
+        console.warn(`  [MCP] 工具 ${prefixedName} 已存在，跳过注册`)
+        continue
+      }
+
+      const toolClient = client
+      const originalName = tool.name
+
+      this.register({
+        name: prefixedName,
+        description: `[MCP:${serverName} ${tool.description}]`,
+        parameters: tool.inputSchema as Record<string, unknown>,
+        isConcurrencySafe: true,
+        isReadOnly: true,
+        maxResultChars: 3000,
+        execute: async (input: any) => {
+          return toolClient.callTool(originalName, input)
+        },
+      })
+
+      registered.push(prefixedName)
+    }
+
+    return registered
+  }
+
+  // 关闭所有 MCP 客户端，释放子进程资源。注意：如果 Agent Loop 还在运行，调用这个方法可能会导致工具调用失败。
+  async closeAllMCP(): Promise<void> {
+    for (const client of this.mcpClients) {
+      await client.close()
+    }
+    this.mcpClients = []
   }
 
   get(name: string): ToolDefinition | undefined {
