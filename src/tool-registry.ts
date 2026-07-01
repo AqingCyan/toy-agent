@@ -12,6 +12,10 @@ export interface ToolDefinition {
   isConcurrencySafe?: boolean // 能否并行
   isReadOnly?: boolean // 是否只读
   maxResultChars?: number // 结果最大长度
+
+  // 工具加载
+  shouldDefer?: boolean // 是否延迟加载
+  searchHint?: string // 搜索提示词，帮助 ToolSearch 匹配
 }
 
 const DEFAULT_MAX_RESULT_CHARS = 3000
@@ -27,6 +31,9 @@ export class ToolRegistry {
 
   // 当锁不可用时，把等待中的 Promise resolver 放进队列；释放锁后统一唤醒重试。
   private waitQueue: Array<() => void> = []
+
+  // 记录已经被发现的延迟工具，避免在 getActiveTools 时重复返回未发现的工具。
+  private discoveredTools = new Set<string>()
 
   register(...tools: ToolDefinition[]) {
     for (const tool of tools) {
@@ -59,9 +66,9 @@ export class ToolRegistry {
         isConcurrencySafe: true,
         isReadOnly: true,
         maxResultChars: 3000,
-        execute: async (input: any) => {
-          return toolClient.callTool(originalName, input)
-        },
+        shouldDefer: true,
+        searchHint: `${serverName} ${tool.name} ${tool.description}`,
+        execute: async (input: any) => toolClient.callTool(originalName, input),
       })
 
       registered.push(prefixedName)
@@ -84,6 +91,89 @@ export class ToolRegistry {
 
   getAll(): ToolDefinition[] {
     return Array.from(this.tools.values())
+  }
+
+  /**
+   * 获取当前可用的工具列表，过滤掉未发现的延迟工具。
+   * @returns 当前可用的工具定义数组
+   */
+  getActiveTools(): ToolDefinition[] {
+    return this.getAll().filter((tool) => {
+      if (tool.shouldDefer && !this.discoveredTools.has(tool.name)) {
+        return false
+      }
+      return true
+    })
+  }
+
+  /**
+   * 获取延迟工具的提示信息，列出所有未发现的延迟工具及其搜索提示。
+   * @returns 延迟工具提示信息字符串，如果没有延迟工具则返回空字符串
+   */
+  getDeferredToolSummary(): string {
+    const deferred = this.getAll().filter((tool) => {
+      return tool.shouldDefer && !this.discoveredTools.has(tool.name)
+    })
+
+    if (deferred.length === 0) {
+      return ''
+    }
+
+    const lines = deferred.map((tool) => {
+      const hint = tool.searchHint ? ` - ${tool.searchHint}` : ''
+      return ` - ${tool.name}${hint}`
+    })
+
+    return `\n以下工具可用，但需要先通过 tool_search 搜索获取完整定义：\n${lines.join('\n')}`
+  }
+
+  /**
+   * 根据工具名查询工具定义，支持逗号分隔多个工具名。返回匹配的工具定义数组，并将已发现的工具名记录在 discoveredTools 中。
+   * @param query 工具名查询字符串，支持逗号分隔多个工具名
+   * @returns 匹配的工具定义数组
+   */
+  searchTools(query: string): ToolDefinition[] {
+    const q = query.trim()
+    const result: ToolDefinition[] = []
+
+    const names = q.includes(',') ? q.split(',').map(n => n.trim()).filter(Boolean) : [q]
+
+    for (const name of names) {
+      const tool = this.tools.get(name)
+      if (tool && tool.name !== 'tool_search') {
+        result.push(tool)
+        this.discoveredTools.add(tool.name)
+      }
+    }
+
+    return result
+  }
+
+  /**
+   * 统计当前注册的工具的 token 估算值，包括已发现的工具和未发现的延迟工具。用于评估上下文窗口消耗。
+   * @returns 一个对象，包含 active（已发现工具的 token 估算值）、deferred（未发现延迟工具的 token 估算值）和 total（总 token 估算值）三个属性
+   */
+  countTokenEstimate(): { active: number, deferred: number, total: number } {
+    let active = 0
+    let deferred = 0
+
+    for (const tool of this.tools.values()) {
+      const schemaSize = JSON.stringify({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      }).length
+      const tokens = Math.ceil(schemaSize / 4)
+
+      if (tool.shouldDefer && !this.discoveredTools.has(tool.name)) {
+        deferred += tokens
+      }
+      else {
+        active += tokens
+      }
+    }
+
+    return { active, deferred, total: active + deferred }
   }
 
   private async acquireConcurrent(): Promise<void> {
@@ -125,25 +215,26 @@ export class ToolRegistry {
   toAISDKFormat(): Record<string, any> {
     // 转成 AI SDK 期望的工具格式，并在统一出口处做结果裁剪
     const result: Record<string, any> = {}
+    const activeTools = this.getActiveTools()
 
-    for (const [name, tool] of this.tools) {
+    for (const tool of activeTools) {
       const maxChars = tool.maxResultChars
       const executeFn = tool.execute
       // 只有显式声明可并发的工具才走共享锁；默认按串行处理更安全。
       const isSafe = tool.isConcurrencySafe === true
 
-      result[name] = {
+      result[tool.name] = {
         description: tool.description,
         inputSchema: jsonSchema(tool.parameters as any),
         execute: async (input: any) => {
           // 在统一包装层里做调度：读类/纯计算工具可并发，写类工具独占执行。
           if (isSafe) {
             await this.acquireConcurrent()
-            console.log(`  [并发] ${name} 获取共享锁`)
+            console.log(`  [并发] ${tool.name} 获取共享锁`)
           }
           else {
             await this.acquireExclusive()
-            console.log(`  [串行] ${name} 获取独占锁，等待其他工具完成`)
+            console.log(`  [串行] ${tool.name} 获取独占锁，等待其他工具完成`)
           }
           try {
             const raw = await executeFn(input)
