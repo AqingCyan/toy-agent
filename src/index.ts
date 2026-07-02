@@ -1,12 +1,10 @@
 import type { ModelMessage } from 'ai'
-import type { ToolDefinition } from './tool-registry'
+import type { ToolDefinition } from './tools'
 import process from 'node:process'
 import { createInterface } from 'node:readline'
 import { createOpenAI } from '@ai-sdk/openai'
-import { agentLoop } from './agent-loop'
-import { MCPClient } from './mcp-client'
-import { ToolRegistry } from './tool-registry'
-import { allTools } from './tools'
+import { agentLoop } from './agent/loop'
+import { allTools, MCPClient, ToolRegistry } from './tools'
 import 'dotenv/config'
 
 // 模型定义
@@ -57,31 +55,6 @@ const toolSearchTool: ToolDefinition = {
 
 registry.register(toolSearchTool)
 
-// 模拟额外的 MCP 工具（演示工具膨胀问题）
-function registerSimulatedTools() {
-  const simulatedTools: ToolDefinition[] = [
-    // Notion MCP 模拟
-    { name: 'mcp__notion__search_pages', description: '[MCP:notion] 搜索 Notion 页面', parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] }, shouldDefer: true, searchHint: 'notion search pages documents', isConcurrencySafe: true, isReadOnly: true, execute: async ({ query }: any) => JSON.stringify([{ title: `Mock: ${query}`, id: 'page-001' }]) },
-    { name: 'mcp__notion__create_page', description: '[MCP:notion] 创建 Notion 页面', parameters: { type: 'object', properties: { title: { type: 'string' }, content: { type: 'string' } }, required: ['title'] }, shouldDefer: true, searchHint: 'notion create page document write', isConcurrencySafe: false, isReadOnly: false, execute: async ({ title }: any) => `已创建页面: ${title}` },
-    { name: 'mcp__notion__list_databases', description: '[MCP:notion] 列出 Notion 数据库', parameters: { type: 'object', properties: {}, required: [] }, shouldDefer: true, searchHint: 'notion list databases tables', isConcurrencySafe: true, isReadOnly: true, execute: async () => JSON.stringify([{ title: '项目追踪', id: 'db-001' }, { title: '知识库', id: 'db-002' }]) },
-
-    // Playwright MCP 模拟
-    { name: 'mcp__browser__navigate', description: '[MCP:browser] 导航到指定 URL', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] }, shouldDefer: true, searchHint: 'browser navigate open url webpage', isConcurrencySafe: false, isReadOnly: false, execute: async ({ url }: any) => `已导航到 ${url}` },
-    { name: 'mcp__browser__screenshot', description: '[MCP:browser] 对当前页面截图', parameters: { type: 'object', properties: {} }, shouldDefer: true, searchHint: 'browser screenshot capture page', isConcurrencySafe: true, isReadOnly: true, execute: async () => '[screenshot data]' },
-    { name: 'mcp__browser__click', description: '[MCP:browser] 点击页面元素', parameters: { type: 'object', properties: { selector: { type: 'string' } }, required: ['selector'] }, shouldDefer: true, searchHint: 'browser click element button', isConcurrencySafe: false, isReadOnly: false, execute: async ({ selector }: any) => `已点击 ${selector}` },
-    { name: 'mcp__browser__fill', description: '[MCP:browser] 在输入框中填写内容', parameters: { type: 'object', properties: { selector: { type: 'string' }, value: { type: 'string' } }, required: ['selector', 'value'] }, shouldDefer: true, searchHint: 'browser fill input form text', isConcurrencySafe: false, isReadOnly: false, execute: async ({ selector, value }: any) => `已在 ${selector} 填写 ${value}` },
-    { name: 'mcp__browser__get_text', description: '[MCP:browser] 获取页面文本内容', parameters: { type: 'object', properties: { selector: { type: 'string' } }, required: ['selector'] }, shouldDefer: true, searchHint: 'browser get text content extract', isConcurrencySafe: true, isReadOnly: true, execute: async ({ selector }: any) => `Mock text content of ${selector}` },
-
-    // Supabase MCP 模拟
-    { name: 'mcp__supabase__query', description: '[MCP:supabase] 执行 SQL 查询', parameters: { type: 'object', properties: { sql: { type: 'string' } }, required: ['sql'] }, shouldDefer: true, searchHint: 'database sql query select', isConcurrencySafe: true, isReadOnly: true, execute: async ({ sql }: any) => JSON.stringify([{ id: 1, name: 'mock_row', sql }]) },
-    { name: 'mcp__supabase__list_tables', description: '[MCP:supabase] 列出数据库所有表', parameters: { type: 'object', properties: {} }, shouldDefer: true, searchHint: 'database list tables schema', isConcurrencySafe: true, isReadOnly: true, execute: async () => JSON.stringify(['users', 'orders', 'products']) },
-    { name: 'mcp__supabase__describe_table', description: '[MCP:supabase] 查看表结构', parameters: { type: 'object', properties: { table: { type: 'string' } }, required: ['table'] }, shouldDefer: true, searchHint: 'database describe table columns schema', isConcurrencySafe: true, isReadOnly: true, execute: async ({ table }: any) => JSON.stringify({ table, columns: [{ name: 'id', type: 'integer' }, { name: 'name', type: 'text' }] }) },
-  ]
-
-  registry.register(...simulatedTools)
-  return simulatedTools.length
-}
-
 // 连接 MCP server
 async function connectMCP() {
   const githubToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN
@@ -115,9 +88,6 @@ async function connectMCP() {
 
 async function main() {
   await connectMCP()
-
-  const simCount = registerSimulatedTools()
-  console.log(`  已注册 ${simCount} 个模拟 MCP 工具（Notion/Browser/Supabase）`)
 
   const allCount = registry.getAll().length
   const activeTools = registry.getActiveTools()

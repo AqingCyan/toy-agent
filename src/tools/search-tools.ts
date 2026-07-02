@@ -1,5 +1,8 @@
 import type { ToolDefinition } from './tool-registry.js'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join, relative, resolve } from 'node:path'
 import process from 'node:process'
+import fg from 'fast-glob'
 import TurndownService from 'turndown'
 
 // ── Tavily（自动挡）──────────────────────────────
@@ -155,6 +158,173 @@ export const webFetchTool: ToolDefinition = {
   },
 }
 
+export const fetchUrlTool: ToolDefinition = {
+  name: 'fetch_url',
+  description: '抓取指定 URL 的网页内容并转换为纯文本（自动剥离 HTML 标签）',
+  parameters: {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: '完整 URL，必须以 http:// 或 https:// 开头' },
+    },
+    required: ['url'],
+    additionalProperties: false,
+  },
+  isConcurrencySafe: true, // 只读、可并发——抓多个 URL 时直接并行
+  isReadOnly: true,
+  maxResultChars: 1500, // 网页通常很长，截断兜底
+  execute: async ({ url }: { url: string }) => {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 SuperAgent' },
+        signal: AbortSignal.timeout(10000),
+      })
+      if (!res.ok) {
+        return `请求失败：HTTP ${res.status}`
+      }
+      const html = await res.text()
+      return html
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim() || '页面无文本内容'
+    }
+    catch (err: any) {
+      return `抓取失败：${err.message}`
+    }
+  },
+}
+
+export const globTool: ToolDefinition = {
+  name: 'glob',
+  description: '按模式搜索文件。支持 * 和 ** 通配符，如 "src/**/*.ts" 匹配 src 下所有 TypeScript 文件',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: '搜索模式，如 "**/*.ts"、"src/*.json"' },
+      path: { type: 'string', description: '搜索起始目录，默认当前目录' },
+    },
+    required: ['pattern'],
+    additionalProperties: false,
+  },
+  isConcurrencySafe: true,
+  isReadOnly: true,
+  execute: async ({ pattern, path = '.' }: { pattern: string, path?: string }) => {
+    // 从 resolve(path) 指定的目录开始搜索，只找普通文件，跳过 node_modules 和 .git，默认不包含隐藏文件，也不跟随符号链接
+    const results = await fg(pattern, {
+      cwd: resolve(path),
+      ignore: ['node_modules/**', '.git/**'],
+      dot: false,
+      onlyFiles: true,
+      followSymbolicLinks: false,
+    })
+    if (results.length === 0) {
+      return `没有找到匹配 "${pattern}" 的文件`
+    }
+    return results.sort().join('\n')
+  },
+}
+
+export const grepTool: ToolDefinition = {
+  name: 'grep',
+  description: '在文件中搜索匹配指定模式的内容。返回匹配的行号和内容',
+  parameters: {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: '搜索模式（正则表达式）' },
+      path: { type: 'string', description: '搜索路径（文件或目录），默认当前目录' },
+    },
+    required: ['pattern'],
+    additionalProperties: false,
+  },
+  isConcurrencySafe: true,
+  isReadOnly: true,
+  execute: async ({ pattern, path = '.' }: { pattern: string, path?: string }) => {
+    const baseDir = resolve(path)
+    const regex = new RegExp(pattern, 'i')
+    const matches: string[] = []
+    const SKIP = new Set(['node_modules', '.git', 'dist'])
+    const BIN_EXT = new Set(['.png', '.jpg', '.gif', '.woff', '.woff2', '.ico', '.lock'])
+
+    function searchFile(filePath: string) {
+      if (matches.length >= 50) {
+        return
+      }
+      const ext = filePath.slice(filePath.lastIndexOf('.'))
+      if (BIN_EXT.has(ext)) {
+        return
+      }
+
+      let content: string
+      try {
+        content = readFileSync(filePath, 'utf-8')
+      }
+      catch {
+        return
+      }
+
+      const lines = content.split('\n')
+      const rel = relative(baseDir, filePath)
+
+      for (let i = 0; i < lines.length; i++) {
+        if (regex.test(lines[i])) {
+          matches.push(`${rel}:${i + 1}: ${lines[i].trimEnd()}`)
+          if (matches.length >= 50) {
+            return
+          }
+        }
+      }
+    }
+
+    function walk(dir: string) {
+      if (matches.length >= 50) {
+        return
+      }
+
+      let entries: string[]
+      try {
+        entries = readdirSync(dir)
+      }
+      catch {
+        return
+      }
+
+      for (const name of entries) {
+        if (SKIP.has(name)) {
+          continue
+        }
+        const fullPath = join(dir, name)
+        try {
+          const stat = statSync(fullPath)
+          if (stat.isDirectory()) {
+            walk(fullPath)
+          }
+          else {
+            searchFile(fullPath)
+          }
+        }
+        catch {
+          /* skip */
+        }
+      }
+    }
+
+    const stat = statSync(baseDir)
+    if (stat.isFile()) {
+      searchFile(baseDir)
+    }
+    else {
+      walk(baseDir)
+    }
+
+    if (matches.length === 0) {
+      return `没有找到匹配 "${pattern}" 的内容`
+    }
+    const suffix = matches.length >= 50 ? '\n... (结果已截断，共 50+ 条匹配)' : ''
+    return matches.join('\n') + suffix
+  },
+}
+
 const turndown = new TurndownService({
   headingStyle: 'atx',
   codeBlockStyle: 'fenced',
@@ -177,3 +347,11 @@ export function pickSearchTool(): ToolDefinition {
   // 都没配就返回 tavily 版（会提示配置 API Key）
   return tavilySearchTool
 }
+
+export const searchToolDefinitions: ToolDefinition[] = [
+  globTool,
+  grepTool,
+  fetchUrlTool,
+  pickSearchTool(),
+  webFetchTool,
+]

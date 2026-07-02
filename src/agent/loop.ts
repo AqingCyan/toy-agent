@@ -1,5 +1,5 @@
 import type { ModelMessage } from 'ai'
-import type { ToolRegistry } from './tool-registry.js'
+import type { ToolRegistry } from '../tools'
 import process from 'node:process'
 import { streamText } from 'ai'
 import { detect, recordCall, recordResult, resetHistory } from './loop-detection.js'
