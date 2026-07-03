@@ -4,6 +4,7 @@ import process from 'node:process'
 import { createInterface } from 'node:readline'
 import { createOpenAI } from '@ai-sdk/openai'
 import { agentLoop } from './agent/loop'
+import { SessionStore } from './session/store'
 import { allTools, MCPClient, ToolRegistry } from './tools'
 import 'dotenv/config'
 
@@ -99,10 +100,22 @@ async function main() {
   console.log(`  延迟工具: ${allCount - activeTools.length} 个`)
   console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟)`)
 
+  // Session 持久化
+  const isContinue = process.argv.includes('--continue')
+  const sessionId = 'default'
+  const store = new SessionStore(sessionId)
+
+  let messages: ModelMessage[] = []
+  if (isContinue && store.exists()) {
+    messages = store.load()
+    console.log(`\n[Session] 恢复会话 "${sessionId}"，${messages.length} 条历史消息`)
+  }
+  else {
+    console.log(`\n[Session] 新会话 "${sessionId}"`)
+  }
+
   const deferredSummary = registry.getDeferredToolSummary()
 
-  // 消息历史
-  const messages: ModelMessage[] = []
   // 简单的交互式命令行定义
   const rl = createInterface({ input: process.stdin, output: process.stdout })
 
@@ -116,13 +129,21 @@ async function main() {
       const trimmed = input.trim()
       if (!trimmed || trimmed === 'exit') {
         console.log('Good Bye! 👋')
+        await registry.closeAllMCP()
         rl.close()
         return
       }
 
-      messages.push({ role: 'user', content: trimmed })
+      const userMsg: ModelMessage = { role: 'user', content: trimmed }
+      messages.push(userMsg)
+      store.append(userMsg)
 
+      const beforeLen = messages.length
       await agentLoop(model, registry, messages, SYSTEM)
+
+      // 持久化本轮新增的消息（agent loop 会往 messages 里 push assistant/tool 消息）
+      const newMessages = messages.slice(beforeLen)
+      store.appendAll(newMessages)
 
       ask()
     })
