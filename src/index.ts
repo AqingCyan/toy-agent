@@ -1,9 +1,17 @@
 import type { ModelMessage } from 'ai'
+import type { PromptContext } from './context/prompt-builder'
 import type { ToolDefinition } from './tools'
 import process from 'node:process'
 import { createInterface } from 'node:readline'
 import { createOpenAI } from '@ai-sdk/openai'
 import { agentLoop } from './agent/loop'
+import {
+  coreRules,
+  deferredTools,
+  PromptBuilder,
+  sessionContext,
+  toolGuide,
+} from './context/prompt-builder'
 import { SessionStore } from './session/store'
 import { allTools, MCPClient, ToolRegistry } from './tools'
 import 'dotenv/config'
@@ -114,15 +122,27 @@ async function main() {
     console.log(`\n[Session] 新会话 "${sessionId}"`)
   }
 
-  const deferredSummary = registry.getDeferredToolSummary()
+  // Prompt Pipe 组装 system prompt
+  const builder = new PromptBuilder()
+    .pipe('coreRules', coreRules())
+    .pipe('toolGuide', toolGuide())
+    .pipe('deferredTools', deferredTools())
+    .pipe('sessionContext', sessionContext())
+
+  const promptCtx: PromptContext = {
+    toolCount: registry.getActiveTools().length,
+    deferredToolSummary: registry.getDeferredToolSummary(),
+    sessionMessageCount: messages.length,
+    sessionId,
+  }
+
+  const SYSTEM = builder.build(promptCtx)
+
+  // Debug: 显示 Prompt Pipe 各模块状态
+  builder.debug(promptCtx)
 
   // 简单的交互式命令行定义
   const rl = createInterface({ input: process.stdin, output: process.stdout })
-
-  const SYSTEM = `你是 Toy Agent，一个有工具调用能力的 AI 助手。
-  你有内置工具和 MCP 工具可用。
-  如果你需要的工具不在当前列表中，使用 tool_search 工具搜索可用工具。
-  回答要简洁直接。${deferredSummary}`
 
   function ask() {
     rl.question('\nYou: ', async (input) => {
@@ -149,7 +169,7 @@ async function main() {
     })
   }
 
-  console.log('Toy Agent v0.2 - Agent Loop (type "exit" to quit)\n')
+  console.log('Toy Agent - Agent Loop (type "exit" to quit)\n')
   ask()
 }
 
