@@ -5,8 +5,6 @@ import process from 'node:process'
 import fg from 'fast-glob'
 import TurndownService from 'turndown'
 
-// ── Tavily（自动挡）──────────────────────────────
-
 export const tavilySearchTool: ToolDefinition = {
   name: 'web_search',
   description: '搜索互联网获取最新信息。返回相关网页的标题、链接和内容摘要',
@@ -21,6 +19,15 @@ export const tavilySearchTool: ToolDefinition = {
   isConcurrencySafe: true,
   isReadOnly: true,
   maxResultChars: 3000,
+  /**
+   * 调用 Tavily 搜索接口并整理摘要与结果列表。
+   *
+   * @param input - 搜索参数。
+   * @param input.query - 搜索关键词。
+   * @param input.max_results - 最大结果数，默认为 5。
+   * @returns Markdown 格式的搜索结果，或配置缺失、请求失败等状态说明。
+   * @throws 当网络请求失败或响应无法解析为 JSON 时抛出错误。
+   */
   execute: async ({ query, max_results = 5 }: { query: string, max_results?: number }) => {
     const apiKey = process.env.TAVILY_API_KEY
     if (!apiKey) {
@@ -60,8 +67,6 @@ export const tavilySearchTool: ToolDefinition = {
   },
 }
 
-// ── Serper（手动挡）──────────────────────────────
-
 export const serperSearchTool: ToolDefinition = {
   name: 'web_search',
   description: '搜索互联网获取最新信息。返回 Google 搜索结果的标题、链接和摘要',
@@ -76,6 +81,15 @@ export const serperSearchTool: ToolDefinition = {
   isConcurrencySafe: true,
   isReadOnly: true,
   maxResultChars: 3000,
+  /**
+   * 调用 Serper 搜索接口并整理知识图谱摘要与自然搜索结果。
+   *
+   * @param input - 搜索参数。
+   * @param input.query - 搜索关键词。
+   * @param input.max_results - 最大结果数，默认为 5。
+   * @returns Markdown 格式的搜索结果，或配置缺失、请求失败等状态说明。
+   * @throws 当网络请求失败或响应无法解析为 JSON 时抛出错误。
+   */
   execute: async ({ query, max_results = 5 }: { query: string, max_results?: number }) => {
     const apiKey = process.env.SERPER_API_KEY
     if (!apiKey) {
@@ -98,7 +112,6 @@ export const serperSearchTool: ToolDefinition = {
     const data = await res.json() as any
     const lines: string[] = []
 
-    // Knowledge Graph（如果有）
     if (data.knowledgeGraph) {
       const kg = data.knowledgeGraph
       lines.push(`## ${kg.title}`)
@@ -108,7 +121,6 @@ export const serperSearchTool: ToolDefinition = {
       lines.push('')
     }
 
-    // Organic Results
     for (const r of (data.organic || []).slice(0, max_results)) {
       lines.push(`### ${r.title}`)
       lines.push(r.link)
@@ -119,8 +131,6 @@ export const serperSearchTool: ToolDefinition = {
     return lines.join('\n') || '没有找到相关结果'
   },
 }
-
-// ── Web Fetch（手动挡配套）──────────────────────────────
 
 export const webFetchTool: ToolDefinition = {
   name: 'web_fetch',
@@ -135,6 +145,13 @@ export const webFetchTool: ToolDefinition = {
   isConcurrencySafe: true,
   isReadOnly: true,
   maxResultChars: 3000,
+  /**
+   * 抓取网页，并通过 Turndown 将 HTML 转换为 Markdown。
+   *
+   * @param input - 抓取参数。
+   * @param input.url - 要抓取的完整 URL。
+   * @returns Markdown 正文，或 HTTP、超时及其他抓取失败的说明。
+   */
   execute: async ({ url }: { url: string }) => {
     try {
       const res = await fetch(url, {
@@ -169,9 +186,16 @@ export const fetchUrlTool: ToolDefinition = {
     required: ['url'],
     additionalProperties: false,
   },
-  isConcurrencySafe: true, // 只读、可并发——抓多个 URL 时直接并行
+  isConcurrencySafe: true,
   isReadOnly: true,
-  maxResultChars: 1500, // 网页通常很长，截断兜底
+  maxResultChars: 1500, // 网页正文易超长，因此使用更小的正文裁剪预算。
+  /**
+   * 抓取网页并用简单规则移除脚本、样式与 HTML 标签。
+   *
+   * @param input - 抓取参数。
+   * @param input.url - 要抓取的 HTTP 或 HTTPS URL。
+   * @returns 归一化后的纯文本，或 HTTP、超时及其他抓取失败的说明。
+   */
   execute: async ({ url }: { url: string }) => {
     try {
       const res = await fetch(url, {
@@ -209,8 +233,16 @@ export const globTool: ToolDefinition = {
   },
   isConcurrencySafe: true,
   isReadOnly: true,
+  /**
+   * 从指定目录匹配普通、非隐藏文件，并排除 `node_modules` 与 `.git`。
+   *
+   * @param input - 匹配参数。
+   * @param input.pattern - fast-glob 支持的文件匹配模式。
+   * @param input.path - 搜索起始目录，默认为当前工作目录。
+   * @returns 排序后的相对文件路径列表，未命中时返回提示。
+   * @throws fast-glob 拒绝匹配任务时传播原始错误；不存在的起始目录通常按未命中处理。
+   */
   execute: async ({ pattern, path = '.' }: { pattern: string, path?: string }) => {
-    // 从 resolve(path) 指定的目录开始搜索，只找普通文件，跳过 node_modules 和 .git，默认不包含隐藏文件，也不跟随符号链接
     const results = await fg(pattern, {
       cwd: resolve(path),
       ignore: ['node_modules/**', '.git/**'],
@@ -239,6 +271,16 @@ export const grepTool: ToolDefinition = {
   },
   isConcurrencySafe: true,
   isReadOnly: true,
+  /**
+   * 在文件或目录树中执行不区分大小写的尽力式正则搜索，并跳过常见依赖、构建和二进制文件。
+   * 遍历期间无法读取的文件、目录或条目会被跳过。
+   *
+   * @param input - 搜索参数。
+   * @param input.pattern - JavaScript 正则表达式源码。
+   * @param input.path - 文件或目录路径，默认为当前工作目录。
+   * @returns 带相对路径和行号的匹配结果，最多保留 50 条；未命中时返回提示。
+   * @throws 当正则表达式无效或起始路径本身无法读取状态时抛出错误。
+   */
   execute: async ({ pattern, path = '.' }: { pattern: string, path?: string }) => {
     const baseDir = resolve(path)
     const regex = new RegExp(pattern, 'i')
@@ -246,6 +288,11 @@ export const grepTool: ToolDefinition = {
     const SKIP = new Set(['node_modules', '.git', 'dist'])
     const BIN_EXT = new Set(['.png', '.jpg', '.gif', '.woff', '.woff2', '.ico', '.lock'])
 
+    /**
+     * 搜索单个可读文本文件，并把命中项追加到共享结果数组。
+     *
+     * @param filePath - 要搜索的文件绝对路径。
+     */
     function searchFile(filePath: string) {
       if (matches.length >= 50) {
         return
@@ -276,6 +323,11 @@ export const grepTool: ToolDefinition = {
       }
     }
 
+    /**
+     * 深度遍历目录，并搜索其中未被排除的文件。
+     *
+     * @param dir - 要遍历的目录绝对路径。
+     */
     function walk(dir: string) {
       if (matches.length >= 50) {
         return
@@ -304,7 +356,7 @@ export const grepTool: ToolDefinition = {
           }
         }
         catch {
-          /* skip */
+          // 忽略遍历期间消失或无权访问的条目。
         }
       }
     }
@@ -331,12 +383,21 @@ const turndown = new TurndownService({
 })
 turndown.remove(['script', 'style', 'nav', 'footer', 'header', 'iframe'])
 
+/**
+ * 使用共享的 Turndown 配置将 HTML 转换为 Markdown。
+ *
+ * @param html - 原始 HTML 文本。
+ * @returns 转换后的 Markdown 文本。
+ */
 function htmlToMarkdown(html: string): string {
   return turndown.turndown(html)
 }
 
-// ── 根据环境变量选择搜索后端 ──────────────────────────────
-
+/**
+ * 根据可用 API Key 选择默认搜索工具，优先使用 Tavily。
+ *
+ * @returns 当前环境对应的搜索工具；均未配置时返回可提示缺少 Key 的 Tavily 工具。
+ */
 export function pickSearchTool(): ToolDefinition {
   if (process.env.TAVILY_API_KEY) {
     return tavilySearchTool
@@ -344,7 +405,6 @@ export function pickSearchTool(): ToolDefinition {
   if (process.env.SERPER_API_KEY) {
     return serperSearchTool
   }
-  // 都没配就返回 tavily 版（会提示配置 API Key）
   return tavilySearchTool
 }
 

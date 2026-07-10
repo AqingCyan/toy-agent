@@ -1,47 +1,73 @@
 import type { MCPClient } from './mcp-client'
 import { jsonSchema } from 'ai'
 
-// 单个工具的统一定义。这里既描述给模型看的能力，也保留运行时元数据。
+/** 模型可调用工具的描述、执行函数与运行时调度元数据。 */
 export interface ToolDefinition {
+  /** 注册和调用工具时使用的唯一名称。 */
   name: string
+  /** 提供给模型的能力说明。 */
   description: string
+  /** 提供给模型的输入 JSON Schema。 */
   parameters: Record<string, unknown>
+  /**
+   * 执行工具。
+   *
+   * @param input - 通过参数 Schema 校验后的调用参数。
+   * @returns 兑现为工具执行结果的 Promise。
+   */
   execute: (input: any) => Promise<unknown>
 
-  // 元数据——给 Agent Loop 做决策用
-  isConcurrencySafe?: boolean // 能否并行
-  isReadOnly?: boolean // 是否只读
-  maxResultChars?: number // 结果最大长度
-
-  // 工具加载
-  shouldDefer?: boolean // 是否延迟加载
-  searchHint?: string // 搜索提示词，帮助 ToolSearch 匹配
+  /** 是否允许与其他并发安全工具同时执行。 */
+  isConcurrencySafe?: boolean
+  /** 工具是否只读取外部状态。 */
+  isReadOnly?: boolean
+  /** 裁剪时最多保留的原文字符数；省略标记不计入。 */
+  maxResultChars?: number
+  /** 是否在被发现前隐藏工具定义。 */
+  shouldDefer?: boolean
+  /** 帮助模型发现延迟工具的提示文本。 */
+  searchHint?: string
 }
 
 const DEFAULT_MAX_RESULT_CHARS = 3000
 
+/** 负责工具注册、延迟发现、执行调度和 AI SDK 格式转换。 */
 export class ToolRegistry {
-  // 以工具名为 key，方便注册覆盖和按名查找。
+  /** 以名称索引的工具定义；同名注册会覆盖已有定义。 */
   private tools = new Map<string, ToolDefinition>()
+  /** 已连接且需要在退出时关闭的 MCP 客户端。 */
   private mcpClients: Array<MCPClient> = []
 
-  // 简单的读写锁状态：串行工具会持有独占锁；可并发工具会增加共享计数。
+  /** 是否有非并发安全工具持有独占执行权。 */
   private exclusiveLock = false
+  /** 当前正在执行的并发安全工具数量。 */
   private concurrentCount = 0
 
-  // 当锁不可用时，把等待中的 Promise resolver 放进队列；释放锁后统一唤醒重试。
+  /** 等待锁状态变化的任务唤醒函数。 */
   private waitQueue: Array<() => void> = []
 
-  // 记录已经被发现的延迟工具，避免在 getActiveTools 时重复返回未发现的工具。
+  /** 已通过搜索显式发现的延迟工具名称。 */
   private discoveredTools = new Set<string>()
 
+  /**
+   * 注册一个或多个工具，同名工具以后注册的定义为准。
+   *
+   * @param tools - 要加入注册表的工具定义。
+   */
   register(...tools: ToolDefinition[]) {
     for (const tool of tools) {
       this.tools.set(tool.name, tool)
     }
   }
 
-  // 注册 MCP server 的工具，给每个工具加上前缀，避免与本地工具冲突。
+  /**
+   * 连接 MCP 服务，并把其工具以前缀名称注册为延迟工具。
+   *
+   * @param serverName - 用于构造 `mcp__<server>__<tool>` 名称的服务标识。
+   * @param client - 尚待连接的 MCP 客户端。
+   * @returns 成功注册的前缀工具名称列表；同名工具会被跳过。
+   * @throws 当 MCP 连接或工具列表请求失败时抛出错误。
+   */
   async registerMCPServer(serverName: string, client: MCPClient): Promise<string[]> {
     await client.connect()
     this.mcpClients.push(client)
@@ -59,6 +85,7 @@ export class ToolRegistry {
       const toolClient = client
       const originalName = tool.name
 
+      // 当前类型未读取服务端 annotations，因此暂按只读、可并发注册；接入写工具时需调整该假设。
       this.register({
         name: prefixedName,
         description: `[MCP:${serverName} ${tool.description}]`,
@@ -68,6 +95,13 @@ export class ToolRegistry {
         maxResultChars: 3000,
         shouldDefer: true,
         searchHint: `${serverName} ${tool.name} ${tool.description}`,
+        /**
+         * 将注册表调用转发给 MCP 服务端的原始工具。
+         *
+         * @param input - MCP 工具调用参数。
+         * @returns MCP 客户端合并后的文本结果。
+         * @throws MCP 请求超时或服务端返回 JSON-RPC 错误时抛出错误。
+         */
         execute: async (input: any) => toolClient.callTool(originalName, input),
       })
 
@@ -77,7 +111,13 @@ export class ToolRegistry {
     return registered
   }
 
-  // 关闭所有 MCP 客户端，释放子进程资源。注意：如果 Agent Loop 还在运行，调用这个方法可能会导致工具调用失败。
+  /**
+   * 依次请求关闭已连接的 MCP 客户端，并清空客户端列表。
+   * Agent Loop 仍在执行时调用，进行中的请求可能失败或超时；已注册工具不会被注销。
+   *
+   * @returns 所有客户端都收到关闭信号后兑现的 Promise；不保证子进程已经退出。
+   * @throws 当任一客户端关闭失败时抛出错误。
+   */
   async closeAllMCP(): Promise<void> {
     for (const client of this.mcpClients) {
       await client.close()
@@ -85,17 +125,29 @@ export class ToolRegistry {
     this.mcpClients = []
   }
 
+  /**
+   * 按完整名称查找工具。
+   *
+   * @param name - 工具名称。
+   * @returns 对应的工具定义，不存在时返回 `undefined`。
+   */
   get(name: string): ToolDefinition | undefined {
     return this.tools.get(name)
   }
 
+  /**
+   * 获取注册表中的全部工具，包括尚未发现的延迟工具。
+   *
+   * @returns 按注册顺序排列的工具定义数组。
+   */
   getAll(): ToolDefinition[] {
     return Array.from(this.tools.values())
   }
 
   /**
-   * 获取当前可用的工具列表，过滤掉未发现的延迟工具。
-   * @returns 当前可用的工具定义数组
+   * 获取当前可用的工具，排除尚未发现的延迟工具。
+   *
+   * @returns 当前可提供给模型的工具定义数组。
    */
   getActiveTools(): ToolDefinition[] {
     return this.getAll().filter((tool) => {
@@ -107,8 +159,9 @@ export class ToolRegistry {
   }
 
   /**
-   * 获取延迟工具的提示信息，列出所有未发现的延迟工具及其搜索提示。
-   * @returns 延迟工具提示信息字符串，如果没有延迟工具则返回空字符串
+   * 生成尚未发现的延迟工具摘要，供系统提示引导工具发现。
+   *
+   * @returns 延迟工具名称与搜索提示；没有待发现工具时返回空字符串。
    */
   getDeferredToolSummary(): string {
     const deferred = this.getAll().filter((tool) => {
@@ -128,9 +181,10 @@ export class ToolRegistry {
   }
 
   /**
-   * 根据工具名查询工具定义，支持逗号分隔多个工具名。返回匹配的工具定义数组，并将已发现的工具名记录在 discoveredTools 中。
-   * @param query 工具名查询字符串，支持逗号分隔多个工具名
-   * @returns 匹配的工具定义数组
+   * 按精确名称查找工具，并将命中的延迟工具标记为已发现。
+   *
+   * @param query - 单个工具名或以逗号分隔的多个工具名。
+   * @returns 按查询顺序排列的工具定义；`tool_search` 本身不会被返回。
    */
   searchTools(query: string): ToolDefinition[] {
     const q = query.trim()
@@ -150,8 +204,9 @@ export class ToolRegistry {
   }
 
   /**
-   * 统计当前注册的工具的 token 估算值，包括已发现的工具和未发现的延迟工具。用于评估上下文窗口消耗。
-   * @returns 一个对象，包含 active（已发现工具的 token 估算值）、deferred（未发现延迟工具的 token 估算值）和 total（总 token 估算值）三个属性
+   * 按序列化字符数估算活跃工具和延迟工具占用的 token 数。
+   *
+   * @returns 活跃、延迟以及两者合计的 token 估算值。
    */
   countTokenEstimate(): { active: number, deferred: number, total: number } {
     let active = 0
@@ -176,58 +231,83 @@ export class ToolRegistry {
     return { active, deferred, total: active + deferred }
   }
 
+  /**
+   * 等待独占工具结束，然后登记一个并发安全工具正在执行。
+   * 该锁偏向并发安全任务且不保证 FIFO，持续的新共享任务可能延后独占任务。
+   *
+   * @returns 获得共享执行权后兑现的 Promise。
+   */
   private async acquireConcurrent(): Promise<void> {
-    // 可并发工具只需要等待独占工具结束；多个可并发工具之间允许同时运行。
     while (this.exclusiveLock) {
       await new Promise<void>(r => this.waitQueue.push(r))
     }
     this.concurrentCount++
   }
 
+  /**
+   * 释放一个并发安全工具占用的共享执行权。
+   */
   private releaseConcurrent(): void {
     this.concurrentCount--
-    // 最后一个并发工具结束后，可能有串行工具正在等待独占执行权。
     if (this.concurrentCount === 0) {
       this.drainQueue()
     }
   }
 
+  /**
+   * 等待其他工具全部结束，然后获取独占执行权。
+   *
+   * @returns 获得独占执行权后兑现的 Promise。
+   */
   private async acquireExclusive(): Promise<void> {
-    // 串行工具需要等独占锁空闲，并且所有并发工具都执行完，避免读写/写写冲突。
     while (this.exclusiveLock || this.concurrentCount > 0) {
       await new Promise<void>(r => this.waitQueue.push(r))
     }
     this.exclusiveLock = true
   }
 
+  /**
+   * 释放独占执行权并唤醒等待中的任务。
+   */
   private releaseExclusive(): void {
     this.exclusiveLock = false
-    // 独占工具结束后，唤醒等待队列，让后续工具重新竞争锁。
     this.drainQueue()
   }
 
+  /**
+   * 唤醒当前等待队列中的全部任务，使其重新检查锁状态。
+   */
   private drainQueue(): void {
-    // splice(0) 会清空当前队列，避免 resolver 被重复调用。
     const waiting = this.waitQueue.splice(0)
     for (const resolve of waiting) resolve()
   }
 
+  /**
+   * 将当前活跃工具转换为 AI SDK 格式，并包装并发调度与结果截断逻辑。
+   *
+   * @returns 以工具名为键的 AI SDK 工具对象。
+   */
   toAISDKFormat(): Record<string, any> {
-    // 转成 AI SDK 期望的工具格式，并在统一出口处做结果裁剪
     const result: Record<string, any> = {}
     const activeTools = this.getActiveTools()
 
     for (const tool of activeTools) {
       const maxChars = tool.maxResultChars
       const executeFn = tool.execute
-      // 只有显式声明可并发的工具才走共享锁；默认按串行处理更安全。
+      // 未显式声明并发安全的工具默认使用独占执行权。
       const isSafe = tool.isConcurrencySafe === true
 
       result[tool.name] = {
         description: tool.description,
         inputSchema: jsonSchema(tool.parameters as any),
+        /**
+         * 在注册表调度约束内执行工具，并把结果序列化、截断为文本。
+         *
+         * @param input - 通过 AI SDK Schema 校验的工具参数。
+         * @returns 适合回传给模型的文本结果。
+         * @throws 工具执行失败或结果无法序列化为文本时抛出错误。
+         */
         execute: async (input: any) => {
-          // 在统一包装层里做调度：读类/纯计算工具可并发，写类工具独占执行。
           if (isSafe) {
             await this.acquireConcurrent()
             console.log(`  [并发] ${tool.name} 获取共享锁`)
@@ -238,13 +318,11 @@ export class ToolRegistry {
           }
           try {
             const raw = await executeFn(input)
-            // AI SDK 的工具结果最终按文本回传给模型，因此这里统一序列化。
             const text = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2)
-            // 避免单个工具返回过大内容，快速消耗上下文窗口。
             return truncateResult(text, maxChars)
           }
           finally {
-            // 不管工具成功、失败还是抛错，都必须释放锁，否则后续工具会一直等待。
+            // 异常路径也必须释放执行权，否则后续工具会永久等待。
             if (isSafe) {
               this.releaseConcurrent()
             }
@@ -259,12 +337,19 @@ export class ToolRegistry {
   }
 }
 
+/**
+ * 将过长结果裁剪为头尾两段，并在中间标明省略字符数。
+ * 头部通常提供上下文，尾部通常包含结论或错误，因此按约 60%/40% 保留两端。
+ *
+ * @param text - 待检查的完整文本。
+ * @param maxChars - 最多保留的原文字符数，默认为 3000；不包含省略标记。
+ * @returns 未超限的原文本，或保留约 60% 开头和 40% 结尾的裁剪结果。
+ */
 export function truncateResult(text: string, maxChars: number = DEFAULT_MAX_RESULT_CHARS): string {
   if (text.length <= maxChars) {
     return text
   }
 
-  // 优先保留开头和结尾：开头通常有上下文，结尾通常有结论或报错信息。
   const headSize = Math.floor(maxChars * 0.6)
   const tailSize = maxChars - headSize
   const head = text.slice(0, headSize)

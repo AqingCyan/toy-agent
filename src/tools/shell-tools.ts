@@ -15,8 +15,14 @@ export const bashTool: ToolDefinition = {
   isConcurrencySafe: false,
   isReadOnly: false,
   maxResultChars: 3000,
+  /**
+   * 在同步子进程中执行一条 shell 命令，并将执行状态转换为文本结果。
+   *
+   * @param input - 命令参数。
+   * @param input.command - 要交给 shell 执行的命令。
+   * @returns 命令的标准输出，或环境不可用、执行失败等状态说明。
+   */
   execute: async ({ command }: { command: string }) => {
-    // 先检测环境是否支持 child_process
     try {
       execSync('echo test', { stdio: 'ignore' })
     }
@@ -27,7 +33,7 @@ export const bashTool: ToolDefinition = {
     try {
       const output = execSync(command, {
         encoding: 'utf-8',
-        timeout: 10000, // 10 秒超时
+        timeout: 10000,
         maxBuffer: 1024 * 1024,
         stdio: ['pipe', 'pipe', 'pipe'],
       })

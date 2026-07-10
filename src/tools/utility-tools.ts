@@ -17,6 +17,13 @@ export const weatherTool: ToolDefinition = {
   },
   isConcurrencySafe: true,
   isReadOnly: true,
+  /**
+   * 查询内置的示例天气数据。
+   *
+   * @param input - 查询参数。
+   * @param input.city - 要查询的城市名称。
+   * @returns 已配置城市的天气描述，或暂无数据的提示。
+   */
   execute: async ({ city }: { city: string }) => {
     const data: Record<string, string> = {
       北京: '晴，15-25°C，东南风 2 级',
@@ -40,9 +47,16 @@ export const calculatorTool: ToolDefinition = {
   },
   isConcurrencySafe: true,
   isReadOnly: true,
+  /**
+   * 执行 JavaScript 数学表达式并格式化计算结果。
+   *
+   * @param input - 计算参数。
+   * @param input.expression - 要计算的表达式。
+   * @returns 计算结果，表达式无法执行时返回失败提示。
+   */
   execute: async ({ expression }: { expression: string }) => {
     try {
-      // 生产环境不要用 eval，这里为了演示
+      // 仅用于演示；new Function 会执行输入代码，不应处理不可信内容。
       const result = new Function(`return ${expression}`)()
       return `${expression} = ${result}`
     }
@@ -51,8 +65,6 @@ export const calculatorTool: ToolDefinition = {
     }
   },
 }
-
-// ── Vibe Coding 配套：起一个静态服务器把 app/ 暴露到 localhost ──
 
 let previewServer: Server | null = null
 
@@ -83,6 +95,15 @@ export const startPreviewTool: ToolDefinition = {
   },
   isConcurrencySafe: false,
   isReadOnly: false,
+  /**
+   * 启动单例静态服务器，以当前工作目录下的 `app/` 作为文件路径基准。
+   * 当前路径检查使用字符串前缀，不能作为严格的目录隔离边界。
+   *
+   * @param input - 预览参数。
+   * @param input.port - 监听端口，默认为 8080。
+   * @returns 按当前分支推断的状态提示；复用单例或端口占用时不会验证实际监听地址。
+   * @throws 当服务器因端口占用之外的原因监听失败时抛出错误。
+   */
   execute: async ({ port = 8080 }: { port?: number } = {}) => {
     const root = resolve('app')
     if (!existsSync(root)) {

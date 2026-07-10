@@ -16,10 +16,17 @@ import { SessionStore } from './session/store'
 import { allTools, MCPClient, ToolRegistry } from './tools'
 import 'dotenv/config'
 
-// 模型定义
+// Kimi 提供 OpenAI 兼容接口；请求未显式配置时关闭思考模式。
 const kimi = createOpenAI({
   baseURL: 'https://api.moonshot.cn/v1',
   apiKey: process.env.DASHSCOPE_API_KEY,
+  /**
+   * 为模型请求补充默认的思考模式配置。
+   *
+   * @param input - Fetch 请求目标。
+   * @param init - Fetch 请求选项。
+   * @returns 兑现为底层 Fetch 响应的 Promise。
+   */
   fetch: async (input, init) => {
     if (typeof init?.body === 'string') {
       const body = JSON.parse(init.body) as Record<string, unknown>
@@ -31,11 +38,10 @@ const kimi = createOpenAI({
 })
 const model = kimi.chat('kimi-k2.6')
 
-// 工具定义：集中注册后，Agent Loop 只依赖注册表，不需要直接关心每个工具的实现细节。
+// 注册表统一管理工具定义、执行策略和 MCP 客户端生命周期。
 const registry = new ToolRegistry()
 registry.register(...allTools)
 
-// 注册 tool_search 元工具
 const toolSearchTool: ToolDefinition = {
   name: 'tool_search',
   description: '获取延迟工具的完整定义。传入工具名（从系统提示的延迟工具列表中选取），返回该工具的完整参数 Schema',
@@ -49,6 +55,13 @@ const toolSearchTool: ToolDefinition = {
   },
   isConcurrencySafe: true,
   isReadOnly: true,
+  /**
+   * 查找延迟工具，并将匹配项标记为后续模型调用可用。
+   *
+   * @param input - 工具查询参数。
+   * @param input.query - 一个工具名，或以逗号分隔的多个工具名。
+   * @returns 兑现为匹配工具元数据或未匹配提示的 Promise。
+   */
   execute: async ({ query }: { query: string }) => {
     const results = registry.searchTools(query)
     if (results.length === 0) {
@@ -64,7 +77,13 @@ const toolSearchTool: ToolDefinition = {
 
 registry.register(toolSearchTool)
 
-// 连接 MCP server
+/**
+ * 在环境允许时尝试启动并注册 GitHub MCP 工具。
+ *
+ * 连接失败只会记录提示，不会中止 CLI 初始化。
+ *
+ * @returns 完成环境检查和 MCP 连接尝试后解决的 Promise。
+ */
 async function connectMCP() {
   const githubToken = process.env.GITHUB_PERSONAL_ACCESS_TOKEN
 
@@ -95,6 +114,11 @@ async function connectMCP() {
   }
 }
 
+/**
+ * 初始化工具、会话和系统提示，并开始等待交互式输入。
+ *
+ * @returns CLI 完成初始化后解决的 Promise。
+ */
 async function main() {
   await connectMCP()
 
@@ -108,7 +132,6 @@ async function main() {
   console.log(`  延迟工具: ${allCount - activeTools.length} 个`)
   console.log(`  Token 估算: ~${estimate.active} (活跃) + ~${estimate.deferred} (延迟)`)
 
-  // Session 持久化
   const isContinue = process.argv.includes('--continue')
   const sessionId = 'default'
   const store = new SessionStore(sessionId)
@@ -122,7 +145,6 @@ async function main() {
     console.log(`\n[Session] 新会话 "${sessionId}"`)
   }
 
-  // Prompt Pipe 组装 system prompt
   const builder = new PromptBuilder()
     .pipe('coreRules', coreRules())
     .pipe('toolGuide', toolGuide())
@@ -138,12 +160,13 @@ async function main() {
 
   const SYSTEM = builder.build(promptCtx)
 
-  // Debug: 显示 Prompt Pipe 各模块状态
   builder.debug(promptCtx)
 
-  // 简单的交互式命令行定义
   const rl = createInterface({ input: process.stdin, output: process.stdout })
 
+  /**
+   * 注册一次输入处理；非退出输入处理完成后继续等待下一条。
+   */
   function ask() {
     rl.question('\nYou: ', async (input) => {
       const trimmed = input.trim()
@@ -158,10 +181,10 @@ async function main() {
       messages.push(userMsg)
       store.append(userMsg)
 
+      // agentLoop 会原地追加本轮上下文消息，因此只持久化新增部分。
       const beforeLen = messages.length
       await agentLoop(model, registry, messages, SYSTEM)
 
-      // 持久化本轮新增的消息（agent loop 会往 messages 里 push assistant/tool 消息）
       const newMessages = messages.slice(beforeLen)
       store.appendAll(newMessages)
 

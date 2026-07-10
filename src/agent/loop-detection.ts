@@ -1,22 +1,36 @@
 import { createHash } from 'node:crypto'
 
+/** 循环检测窗口中的一次工具调用。 */
 export interface ToolCallRecord {
+  /** 工具名称。 */
   toolName: string
+  /** 包含工具名称和参数的稳定指纹。 */
   argsHash: string
+  /** 工具返回后补写的结果指纹。 */
   resultHash?: string
+  /** 调用被记录时的 Unix 毫秒时间戳。 */
   timestamp: number
 }
 
+/** 能触发循环警告或熔断的检测器类型。 */
 export type DetectorKind = 'generic_repeat' | 'ping_pong' | 'global_circuit_breaker'
 
+/** 循环检测结果；命中时包含严重级别、来源、次数与用户提示。 */
 export type DetectionResult = { stuck: false } | { stuck: true, level: 'warning' | 'critical', detector: DetectorKind, count: number, message: string }
 
-const HISTORY_SIZE = 30 // 滑动窗口大小
-const WARNING_THRESHOLD = 5 // 警告阈值（演示用，生产环境通常是 10）
-const CRITICAL_THRESHOLD = 8 // 严重阈值（演示用，生产环境通常是 20）
-const BREAKER_THRESHOLD = 10 // 熔断阈值（演示用，生产环境通常是 30）
+const HISTORY_SIZE = 30
+// 以下低阈值用于演示；生产环境应按工具调用模式和成本重新校准。
+const WARNING_THRESHOLD = 5
+const CRITICAL_THRESHOLD = 8
+const BREAKER_THRESHOLD = 10
 
-// --- 指纹计算 ---
+/**
+ * 将 JSON 可序列化值转换为对象键顺序稳定的字符串，同时保留数组元素顺序。
+ *
+ * @param value - 要序列化的 JSON 兼容值。
+ * @returns 键顺序稳定的序列化结果。
+ * @throws 值包含 BigInt、循环引用等 JSON 无法序列化的结构时抛出错误。
+ */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value)
@@ -29,21 +43,48 @@ function stableStringify(value: unknown): string {
   return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify((value as any)[k])}`).join(',')}}`
 }
 
+/**
+ * 生成用于内部比较的短 SHA-256 哈希。
+ *
+ * @param input - 要计算哈希的字符串。
+ * @returns SHA-256 摘要的前 16 个十六进制字符。
+ */
 function hash(input: string): string {
   return createHash('sha256').update(input).digest('hex').slice(0, 16)
 }
 
+/**
+ * 根据工具名称和参数生成稳定的调用指纹。
+ *
+ * @param toolName - 工具名称。
+ * @param params - JSON 可序列化的工具调用参数。
+ * @returns 包含工具名称的调用指纹。
+ * @throws 参数无法稳定序列化时抛出错误。
+ */
 export function hashToolCall(toolName: string, params: unknown): string {
   return `${toolName}:${hash(stableStringify(params))}`
 }
 
+/**
+ * 根据工具结果生成稳定指纹。
+ *
+ * @param result - JSON 可序列化的工具执行结果。
+ * @returns 工具结果的短哈希。
+ * @throws 结果无法稳定序列化时抛出错误。
+ */
 export function hashResult(result: unknown): string {
   return hash(stableStringify(result))
 }
 
-// --- 滑动窗口 ---
 const history: ToolCallRecord[] = []
 
+/**
+ * 记录一次待执行的工具调用，并将历史限制在最近的固定窗口内。
+ *
+ * @param toolName - 工具名称。
+ * @param params - JSON 可序列化的工具调用参数。
+ * @throws 参数无法稳定序列化时抛出错误。
+ */
 export function recordCall(toolName: string, params: unknown) {
   history.push({ toolName, argsHash: hashToolCall(toolName, params), timestamp: Date.now() })
   if (history.length > HISTORY_SIZE) {
@@ -51,6 +92,14 @@ export function recordCall(toolName: string, params: unknown) {
   }
 }
 
+/**
+ * 将结果指纹关联到最近一条工具和参数均匹配且尚无结果的调用记录。
+ *
+ * @param toolName - 工具名称。
+ * @param params - JSON 可序列化的工具调用参数。
+ * @param result - JSON 可序列化的工具执行结果。
+ * @throws 参数或结果无法稳定序列化时抛出错误。
+ */
 export function recordResult(toolName: string, params: unknown, result: unknown) {
   const argsHash = hashToolCall(toolName, params)
   const resultHash = hashResult(result)
@@ -63,56 +112,20 @@ export function recordResult(toolName: string, params: unknown, result: unknown)
   }
 }
 
+/**
+ * 清空模块级共享的工具调用历史。
+ */
 export function resetHistory() {
   history.length = 0
 }
 
-// --- 检测器 ---
 /**
- * 统计“同一个工具 + 同一组参数”最近连续多少次返回了完全相同的结果。
+ * 统计指定调用指纹最近连续返回相同结果的次数。
+ * 其他调用及尚无结果的记录会被跳过，遇到该指纹的不同结果时停止统计。
  *
- * 这个检测器用于识别“看起来一直在调用工具，但实际上没有任何新进展”的情况。
- * 它会从最新记录开始向前扫描，只关注满足以下条件的历史项：
- * 1. `toolName` 相同
- * 2. `argsHash` 相同
- * 3. 已经有 `resultHash`（说明这次调用已经返回结果）
- *
- * 判断规则：
- * - 先把最近一次匹配到的 `resultHash` 作为基准结果
- * - 继续向前看，只要更早的结果哈希和这个基准一致，就认为仍然处于“无进展连续段”中
- * - 一旦遇到不同的 `resultHash`，就停止统计
- * - 中间遇到别的工具、别的参数，或者尚未写入结果的记录，会直接跳过，不会打断连续段
- *
- * 例子 1：连续无进展
- * history（从旧到新）:
- * - search(A) -> X
- * - search(A) -> X
- * - search(A) -> X
- * 返回：3
- *
- * 例子 2：最近两次相同，但再往前结果变了
- * history（从旧到新）:
- * - search(A) -> X
- * - search(A) -> Y
- * - search(A) -> Y
- * 返回：2
- * 说明：函数只统计“从最近开始连续相同”的长度，不会把更早的 X 算进去。
- *
- * 例子 3：夹杂其他调用，不影响统计
- * history（从旧到新）:
- * - search(A) -> X
- * - read(B)   -> R
- * - search(A) -> X
- * 返回：2
- * 说明：`read(B)` 会被跳过，因为它不是同一个工具/参数组合。
- *
- * 例子 4：最近一次还没有结果
- * history（从旧到新）:
- * - search(A) -> X
- * - search(A) -> [pending]
- * - search(A) -> X
- * 返回：2
- * 说明：没有 `resultHash` 的记录不会参与比较，也不会打断统计。
+ * @param toolName - 工具名称。
+ * @param argHash - 包含工具名称和参数的调用指纹。
+ * @returns 从最新结果向前连续相同的次数。
  */
 function getNoProgressStreak(toolName: string, argHash: string): number {
   let streak = 0
@@ -140,71 +153,11 @@ function getNoProgressStreak(toolName: string, argHash: string): number {
 }
 
 /**
- * 检测最近的参数哈希是否在两个值之间来回交替（ping-pong / 乒乓循环）。
+ * 计算当前调用加入后，历史尾部在两个调用指纹之间严格交替的长度。
+ * 该检测只比较调用指纹，不比较工具结果；当前调用未延续交替模式时返回零。
  *
- * 这个检测器用于识别另一类常见死循环：不是单点重复，而是在两个调用状态之间反复横跳。
- * 典型模式如下（从旧到新）：
- * - A
- * - B
- * - A
- * - B
- * - A
- *
- * 函数的工作方式：
- * 1. 取历史中的最后一个 `argsHash` 作为最近状态 `last.argsHash`
- * 2. 从后往前找到第一个与它不同的哈希，记为 `otherHash`
- * 3. 再从最新记录开始反向检查，看看历史尾部是否严格满足：
- *    `last.argsHash`, `otherHash`, `last.argsHash`, `otherHash` ...
- * 4. 如果当前准备执行的 `currentHash` 恰好等于 `otherHash`，说明“下一步”会继续这个交替模式，
- *    这时返回交替长度 `count + 1`
- * 5. 否则返回 `0`，表示当前调用不会延续这个乒乓循环
- *
- * 注意：
- * - 这里检测的是“参数哈希”的交替，不直接比较结果哈希
- * - 它关注的是历史尾部是否形成了严格的 A/B/A/B 模式
- * - 只有当“当前即将发生的调用”正好补上另一个值时，才认为循环会继续
- *
- * 例子 1：形成乒乓循环
- * history（从旧到新）:
- * - A
- * - B
- * - A
- * - B
- * currentHash = A
- *
- * 从后往前看，历史尾部是：B, A, B, A
- * `last.argsHash = B`，`otherHash = A`，已经形成长度为 4 的交替段。
- * 当前又要执行 A，正好继续这个模式，所以返回 5。
- *
- * 例子 2：历史有交替，但当前不会继续
- * history（从旧到新）:
- * - A
- * - B
- * - A
- * - B
- * currentHash = C
- *
- * 虽然历史尾部是交替的，但当前不是 A，而是 C，
- * 所以下一步不会继续 A/B/A/B 模式，返回 0。
- *
- * 例子 3：不是严格交替
- * history（从旧到新）:
- * - A
- * - B
- * - B
- * - A
- * currentHash = B
- *
- * 从最新往前看是：A, B, B ...
- * 到第三项时不再满足 A/B/A/B 的严格交替，因此不会被识别为 ping-pong，返回 0。
- *
- * 例子 4：历史太短
- * history（从旧到新）:
- * - A
- * - B
- * currentHash = A
- *
- * 长度不足以稳定判断交替模式，直接返回 0。
+ * @param currentHash - 当前准备执行的工具调用指纹。
+ * @returns 加入当前调用后的交替长度，未形成乒乓模式时返回零。
  */
 function getPingPongCount(currentHash: string): number {
   if (history.length < 3) {
@@ -241,7 +194,14 @@ function getPingPongCount(currentHash: string): number {
   return 0
 }
 
-// --- 主检测函数 ---
+/**
+ * 在当前调用入库前，根据近期历史检测无进展、乒乓和同参数重复循环。
+ *
+ * @param toolName - 当前准备调用的工具名称。
+ * @param params - JSON 可序列化的当前工具调用参数。
+ * @returns 未命中循环时返回正常结果，否则返回检测级别、类型、次数和提示信息。
+ * @throws 参数无法稳定序列化时抛出错误。
+ */
 export function detect(toolName: string, params: unknown): DetectionResult {
   const argsHash = hashToolCall(toolName, params)
   const noProgress = getNoProgressStreak(toolName, argsHash)

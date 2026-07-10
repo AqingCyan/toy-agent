@@ -11,6 +11,7 @@ export * from './shell-tools'
 export * from './tool-registry'
 export * from './utility-tools'
 
+/** 项目启动时默认注册的全部内置工具。 */
 export const allTools: ToolDefinition[] = [
   ...fileTools,
   ...searchToolDefinitions,

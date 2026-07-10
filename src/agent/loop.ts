@@ -9,9 +9,19 @@ const MAX_STEPS = 15
 const MAX_RETRIES = 3
 const TOKEN_BUDGET = 50000
 
+/**
+ * 持续请求模型并消费流式响应，直到模型不再调用工具，或触发严重循环、步数及 Token 限制。
+ * 警告级循环只追加提醒；严重循环会在当前流消费完成后退出。可重试错误会重放整个步骤。
+ *
+ * @param model - AI SDK 兼容的语言模型实例。
+ * @param registry - 负责工具格式转换、调度和结果裁剪的工具注册表。
+ * @param messages - 会被追加循环检测提醒和模型响应的会话消息数组。
+ * @param system - 每轮模型请求使用的系统提示词。
+ * @returns Agent 循环结束后完成的 Promise。
+ * @throws 步骤处理中的错误不可重试或耗尽重试次数时，抛出原始错误。
+ */
 export async function agentLoop(
   model: any,
-  // 传入工具注册表，而不是裸 tools 对象；注册表负责统一转换格式、控制并发和裁剪结果。
   registry: ToolRegistry,
   messages: ModelMessage[],
   system: string,
@@ -32,13 +42,11 @@ export async function agentLoop(
     let stepResponse: Awaited<ReturnType<typeof streamText>['response']>
     let stepUsage: Awaited<ReturnType<typeof streamText>['usage']>
 
-    // 步骤级重试：包裹整个 stream 消费过程
     for (let attempt = 1; ; attempt++) {
       try {
         const result = streamText({
           model,
           system,
-          // 每轮调用前从注册表生成 AI SDK 工具格式，工具执行会先经过注册表的包装层。
           tools: registry.toAISDKFormat(),
           messages,
           maxRetries: 0,
@@ -109,7 +117,6 @@ export async function agentLoop(
 
     messages.push(...stepResponse.messages)
 
-    // Token 预算追踪
     const inp = stepUsage?.inputTokens ?? 0
     const out = stepUsage?.outputTokens ?? 0
     totalTokens += inp + out
@@ -120,7 +127,7 @@ export async function agentLoop(
       break
     }
 
-    // 退出条件：模型没有调用任何工具，说明它认为可以直接回复了
+    // 没有工具调用表示模型已经给出最终回复。
     if (!hasToolCall) {
       if (fullText) {
         console.log()
