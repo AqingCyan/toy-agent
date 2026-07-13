@@ -5,6 +5,7 @@ import process from 'node:process'
 import { createInterface } from 'node:readline'
 import { createOpenAI } from '@ai-sdk/openai'
 import { agentLoop } from './agent/loop'
+import { estimateTokens, microCompact, summarize } from './context/compressor'
 import {
   coreRules,
   deferredTools,
@@ -115,7 +116,7 @@ async function connectMCP() {
 }
 
 /**
- * 初始化工具、会话和系统提示，并开始等待交互式输入。
+ * 初始化工具和会话，对恢复的历史执行分层压缩，然后开始等待交互式输入。
  *
  * @returns CLI 完成初始化后解决的 Promise。
  */
@@ -145,6 +146,35 @@ async function main() {
     console.log(`\n[Session] 新会话 "${sessionId}"`)
   }
 
+  // 摘要仅保存在当前进程内，供后续多次 LLM 压缩增量合并。
+  let summary = ''
+
+  // 启动时先清理可丢弃的旧工具输出，再用模型摘要更早的完整对话轮次。
+  const beforeTokens = estimateTokens(messages)
+  console.log(`\n[压缩前] ${messages.length} 条消息, ~${beforeTokens} tokens`)
+
+  const mc = microCompact(messages)
+  messages = mc.messages
+  const afterMCTokens = estimateTokens(messages)
+  console.log(`[Layer 1: MicroCompact] 清理了 ${mc.cleared} 个工具结果, ~${afterMCTokens} tokens`)
+
+  const compResult = await summarize(model, messages, summary)
+  messages = compResult.messages
+  summary = compResult.summary
+  const afterSumTokens = estimateTokens(messages)
+  if (compResult.compressedCount > 0) {
+    console.log(`[Layer 2: Summarization] 压缩了 ${compResult.compressedCount} 条消息, ~${afterSumTokens} tokens`)
+    console.log(`[摘要预览] ${summary.slice(0, 150)}...`)
+  }
+  else {
+    console.log(`[Layer 2: Summarization] 未触发（消息量不够）`)
+  }
+
+  console.log(`[压缩后] ${messages.length} 条消息, ~${afterSumTokens} tokens (节省 ${beforeTokens - afterSumTokens} tokens)\n`)
+
+  // 压缩统计完成后从空的内存上下文开始交互；已有会话文件不会被清除。
+  messages = []
+
   const builder = new PromptBuilder()
     .pipe('coreRules', coreRules())
     .pipe('toolGuide', toolGuide())
@@ -165,7 +195,8 @@ async function main() {
   const rl = createInterface({ input: process.stdin, output: process.stdout })
 
   /**
-   * 注册一次输入处理；非退出输入处理完成后继续等待下一条。
+   * 处理一轮用户输入，持久化新增消息，并在上下文过长时执行分层压缩。
+   * 非退出输入处理完成后会继续注册下一轮等待。
    */
   function ask() {
     rl.question('\nYou: ', async (input) => {
@@ -187,6 +218,24 @@ async function main() {
 
       const newMessages = messages.slice(beforeLen)
       store.appendAll(newMessages)
+
+      // 超过运行时阈值后，先做无模型调用的微压缩，再按需生成增量摘要。
+      const currentTokens = estimateTokens(messages)
+      if (currentTokens > 4000) {
+        console.log(`\n  [压缩检查] ~${currentTokens} tokens, 触发压缩...`)
+        const mc2 = microCompact(messages)
+        messages = mc2.messages
+        if (mc2.cleared > 0) {
+          console.log(`  [MicroCompact] 清理了 ${mc2.cleared} 个工具结果`)
+        }
+
+        const comp2 = await summarize(model, messages, summary)
+        if (comp2.compressedCount > 0) {
+          messages = comp2.messages
+          summary = comp2.summary
+          console.log(`  [Summarization] 压缩了 ${comp2.compressedCount} 条消息, ~${estimateTokens(messages)} tokens`)
+        }
+      }
 
       ask()
     })

@@ -1,6 +1,14 @@
 import type { ModelMessage } from 'ai'
 import { generateText } from 'ai'
 
+/**
+ * 按消息中的文本和工具输出字符数粗略估算上下文 Token 数。
+ * 该估算使用“四个字符约等于一个 Token”的规则，并忽略无法识别的内容块。
+ *
+ * @param messages - 要估算的模型消息列表。
+ * @returns 向上取整后的 Token 估算值。
+ * @throws 工具输出无法通过 `JSON.stringify` 序列化时抛出错误。
+ */
 function estimateTokens(messages: ModelMessage[]): number {
   let chats = 0
   for (const msg of messages) {
@@ -22,6 +30,7 @@ function estimateTokens(messages: ModelMessage[]): number {
   return Math.ceil(chats / 4)
 }
 
+/** 允许在较早消息中丢弃输出正文的工具名称。 */
 const CLEARABLE_TOOLS = new Set([
   'read_file',
   'bash',
@@ -31,6 +40,7 @@ const CLEARABLE_TOOLS = new Set([
   'edit_file',
   'write_file',
 ])
+/** 微压缩时原样保留的最近结构化工具消息数量。 */
 const KEEP_RECENT_TOOL_RESULTS = 3
 
 /**
@@ -81,6 +91,7 @@ export function microCompact(messages: ModelMessage[]): { messages: ModelMessage
   return { messages: result, cleared }
 }
 
+/** 约束摘要结构、语言、关键标识符和长度的系统提示。 */
 const COMPRESS_PROMPT = `你是一个对话压缩系统。你的任务是把 Agent 和用户之间的对话历史压缩成一份结构化摘要，确保后续对话能够无缝继续。
 
 请严格按照以下模板输出，每个字段都要填写。如果某个字段没有相关内容，写"无"：
@@ -106,15 +117,32 @@ const COMPRESS_PROMPT = `你是一个对话压缩系统。你的任务是把 Age
 - 不要写笼统的概述，只保留具体的、可操作的信息
 - 总长度控制在 800 字以内`
 
+/** 触发 LLM 摘要压缩的上下文 Token 估算阈值。 */
 const CONTEXT_TOKEN_THRESHOLD = 300
+/** 计划原样保留的最近消息数；实际边界会向前对齐到用户消息。 */
 const KEEP_RECENT_MESSAGES = 6
 
+/** LLM 摘要压缩后的上下文、摘要文本和替换计数。 */
 export interface CompressionResult {
+  /** 可继续传给模型的消息列表。 */
   messages: ModelMessage[]
+  /** 最新摘要；未压缩或压缩失败时保留已有摘要。 */
   summary: string
+  /** 本次被摘要替换的原始消息数量。 */
   compressedCount: number
 }
 
+/**
+ * 在上下文超过阈值时摘要较早消息，并保留最近一段完整对话。
+ * 压缩边界会向前对齐到用户消息，避免从 assistant 或 tool 消息中间截断对话轮次。
+ * 摘要模型调用失败时会记录错误并返回原始消息。
+ *
+ * @param model - 传给 AI SDK `generateText` 的语言模型实例。
+ * @param messages - 待检查和压缩的完整消息列表。
+ * @param existingSummary - 上一次压缩得到的摘要，用于增量合并历史上下文。
+ * @returns 压缩后的消息和摘要；未达到条件或摘要失败时 `compressedCount` 为零。
+ * @throws 消息内容在 Token 估算或摘要文本组装阶段无法序列化时抛出错误。
+ */
 export async function summarize(model: any, messages: ModelMessage[], existingSummary?: string): Promise<CompressionResult> {
   const tokenEstimate = estimateTokens(messages)
   if (tokenEstimate < CONTEXT_TOKEN_THRESHOLD || messages.length <= KEEP_RECENT_MESSAGES) {
@@ -123,6 +151,7 @@ export async function summarize(model: any, messages: ModelMessage[], existingSu
 
   const splitIndex = Math.max(0, messages.length - KEEP_RECENT_MESSAGES)
 
+  // 从用户消息开始保留，避免留下缺少调用上下文的 assistant/tool 消息。
   let alignedIdx = splitIndex
   while (alignedIdx > 0 && messages[alignedIdx].role !== 'user') {
     alignedIdx--
@@ -173,6 +202,7 @@ export async function summarize(model: any, messages: ModelMessage[], existingSu
     }
   }
   catch (err) {
+    // 摘要不可用时保留原上下文，避免压缩失败影响主对话流程。
     console.error('[Compaction] LLM 摘要失败:', err)
     return { messages, summary: existingSummary || '', compressedCount: 0 }
   }
