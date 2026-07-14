@@ -39,6 +39,64 @@ const kimi = createOpenAI({
 })
 const model = kimi.chat('kimi-k2.6')
 
+/** 触发上下文分层压缩的 Token 估算阈值。 */
+const COMPACTION_TOKEN_THRESHOLD = 4000
+
+/** 一次压缩检查后的上下文状态和统计。 */
+interface CompactionCheckResult {
+  /** 可继续传给模型的消息列表。 */
+  messages: ModelMessage[]
+  /** 当前最新摘要；未压缩时保留传入值。 */
+  summary: string
+  /** 本次是否因超过阈值而执行了分层压缩流程。 */
+  triggered: boolean
+  /** 执行压缩检查时的 Token 估算值。 */
+  beforeTokens: number
+  /** 分层压缩流程结束后的 Token 估算值。 */
+  afterTokens: number
+  /** 微压缩中被清理输出的工具消息数量。 */
+  cleared: number
+  /** 被 LLM 摘要替换的原始消息数量。 */
+  compressedCount: number
+}
+
+/**
+ * 在上下文超过统一阈值时先清理旧工具输出，再摘要较早对话。
+ *
+ * @param messages - 当前模型上下文。
+ * @param summary - 上一次压缩生成的摘要。
+ * @returns 原样或压缩后的上下文、摘要和统计。
+ */
+async function compactIfNeeded(messages: ModelMessage[], summary: string): Promise<CompactionCheckResult> {
+  const beforeTokens = estimateTokens(messages)
+  // 上下文未超过阈值时保留原消息和已有摘要，不调用摘要模型。
+  if (beforeTokens <= COMPACTION_TOKEN_THRESHOLD) {
+    return {
+      messages,
+      summary,
+      triggered: false,
+      beforeTokens,
+      afterTokens: beforeTokens,
+      cleared: 0,
+      compressedCount: 0,
+    }
+  }
+
+  // 第一层先低成本清理较早的工具输出，第二层再用 LLM 摘要较早对话。
+  const microResult = microCompact(messages)
+  const summaryResult = await summarize(model, microResult.messages, summary)
+
+  return {
+    messages: summaryResult.messages,
+    summary: summaryResult.summary,
+    triggered: true,
+    beforeTokens,
+    afterTokens: estimateTokens(summaryResult.messages),
+    cleared: microResult.cleared,
+    compressedCount: summaryResult.compressedCount,
+  }
+}
+
 // 注册表统一管理工具定义、执行策略和 MCP 客户端生命周期。
 const registry = new ToolRegistry()
 registry.register(...allTools)
@@ -116,7 +174,7 @@ async function connectMCP() {
 }
 
 /**
- * 初始化工具和会话，对恢复的历史执行分层压缩，然后开始等待交互式输入。
+ * 初始化工具和会话，必要时压缩恢复的历史，然后开始等待交互式输入。
  *
  * @returns CLI 完成初始化后解决的 Promise。
  */
@@ -138,42 +196,26 @@ async function main() {
   const store = new SessionStore(sessionId)
 
   let messages: ModelMessage[] = []
+  // 摘要仅保存在当前进程内，供后续多次 LLM 压缩增量合并。
+  let summary = ''
+
   if (isContinue && store.exists()) {
     messages = store.load()
     console.log(`\n[Session] 恢复会话 "${sessionId}"，${messages.length} 条历史消息`)
+
+    // 会话文件保存的是未压缩原始历史，首次模型请求前需先检查恢复后的上下文。
+    const compaction = await compactIfNeeded(messages, summary)
+    messages = compaction.messages
+    summary = compaction.summary
+
+    if (compaction.triggered) {
+      console.log(`[Compaction] 恢复历史超过 ~${COMPACTION_TOKEN_THRESHOLD} tokens，清理 ${compaction.cleared} 个工具结果，摘要 ${compaction.compressedCount} 条消息`)
+      console.log(`[Compaction] ~${compaction.beforeTokens} → ~${compaction.afterTokens} tokens`)
+    }
   }
   else {
     console.log(`\n[Session] 新会话 "${sessionId}"`)
   }
-
-  // 摘要仅保存在当前进程内，供后续多次 LLM 压缩增量合并。
-  let summary = ''
-
-  // 启动时先清理可丢弃的旧工具输出，再用模型摘要更早的完整对话轮次。
-  const beforeTokens = estimateTokens(messages)
-  console.log(`\n[压缩前] ${messages.length} 条消息, ~${beforeTokens} tokens`)
-
-  const mc = microCompact(messages)
-  messages = mc.messages
-  const afterMCTokens = estimateTokens(messages)
-  console.log(`[Layer 1: MicroCompact] 清理了 ${mc.cleared} 个工具结果, ~${afterMCTokens} tokens`)
-
-  const compResult = await summarize(model, messages, summary)
-  messages = compResult.messages
-  summary = compResult.summary
-  const afterSumTokens = estimateTokens(messages)
-  if (compResult.compressedCount > 0) {
-    console.log(`[Layer 2: Summarization] 压缩了 ${compResult.compressedCount} 条消息, ~${afterSumTokens} tokens`)
-    console.log(`[摘要预览] ${summary.slice(0, 150)}...`)
-  }
-  else {
-    console.log(`[Layer 2: Summarization] 未触发（消息量不够）`)
-  }
-
-  console.log(`[压缩后] ${messages.length} 条消息, ~${afterSumTokens} tokens (节省 ${beforeTokens - afterSumTokens} tokens)\n`)
-
-  // 压缩统计完成后从空的内存上下文开始交互；已有会话文件不会被清除。
-  messages = []
 
   const builder = new PromptBuilder()
     .pipe('coreRules', coreRules())
@@ -212,30 +254,21 @@ async function main() {
       messages.push(userMsg)
       store.append(userMsg)
 
+      // 每次请求模型前统一检查，避免恢复的大历史或上一轮输出直接超出上下文限制。
+      const compaction = await compactIfNeeded(messages, summary)
+      messages = compaction.messages
+      summary = compaction.summary
+      if (compaction.triggered) {
+        console.log(`\n  [Compaction] ~${compaction.beforeTokens} tokens，清理 ${compaction.cleared} 个工具结果，摘要 ${compaction.compressedCount} 条消息`)
+        console.log(`  [Compaction] 压缩后 ~${compaction.afterTokens} tokens`)
+      }
+
       // agentLoop 会原地追加本轮上下文消息，因此只持久化新增部分。
       const beforeLen = messages.length
       await agentLoop(model, registry, messages, SYSTEM)
 
       const newMessages = messages.slice(beforeLen)
       store.appendAll(newMessages)
-
-      // 超过运行时阈值后，先做无模型调用的微压缩，再按需生成增量摘要。
-      const currentTokens = estimateTokens(messages)
-      if (currentTokens > 4000) {
-        console.log(`\n  [压缩检查] ~${currentTokens} tokens, 触发压缩...`)
-        const mc2 = microCompact(messages)
-        messages = mc2.messages
-        if (mc2.cleared > 0) {
-          console.log(`  [MicroCompact] 清理了 ${mc2.cleared} 个工具结果`)
-        }
-
-        const comp2 = await summarize(model, messages, summary)
-        if (comp2.compressedCount > 0) {
-          messages = comp2.messages
-          summary = comp2.summary
-          console.log(`  [Summarization] 压缩了 ${comp2.compressedCount} 条消息, ~${estimateTokens(messages)} tokens`)
-        }
-      }
 
       ask()
     })

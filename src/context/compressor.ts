@@ -117,10 +117,10 @@ const COMPRESS_PROMPT = `你是一个对话压缩系统。你的任务是把 Age
 - 不要写笼统的概述，只保留具体的、可操作的信息
 - 总长度控制在 800 字以内`
 
-/** 触发 LLM 摘要压缩的上下文 Token 估算阈值。 */
-const CONTEXT_TOKEN_THRESHOLD = 300
 /** 计划原样保留的最近消息数；实际边界会向前对齐到用户消息。 */
 const KEEP_RECENT_MESSAGES = 6
+/** 用于识别已注入模型上下文的历史摘要消息前缀。 */
+const SUMMARY_MESSAGE_PREFIX = '[以下是之前对话的压缩摘要]'
 
 /** LLM 摘要压缩后的上下文、摘要文本和替换计数。 */
 export interface CompressionResult {
@@ -133,19 +133,19 @@ export interface CompressionResult {
 }
 
 /**
- * 在上下文超过阈值时摘要较早消息，并保留最近一段完整对话。
+ * 摘要较早消息，并保留最近一段完整对话。
+ * 是否达到业务压缩阈值由调用方决定；本函数只处理压缩边界和摘要生成。
  * 压缩边界会向前对齐到用户消息，避免从 assistant 或 tool 消息中间截断对话轮次。
  * 摘要模型调用失败时会记录错误并返回原始消息。
  *
  * @param model - 传给 AI SDK `generateText` 的语言模型实例。
  * @param messages - 待检查和压缩的完整消息列表。
  * @param existingSummary - 上一次压缩得到的摘要，用于增量合并历史上下文。
- * @returns 压缩后的消息和摘要；未达到条件或摘要失败时 `compressedCount` 为零。
- * @throws 消息内容在 Token 估算或摘要文本组装阶段无法序列化时抛出错误。
+ * @returns 压缩后的消息和摘要；没有可摘要的较早轮次或摘要失败时 `compressedCount` 为零。
+ * @throws 消息内容在摘要文本组装阶段无法序列化时抛出错误。
  */
 export async function summarize(model: any, messages: ModelMessage[], existingSummary?: string): Promise<CompressionResult> {
-  const tokenEstimate = estimateTokens(messages)
-  if (tokenEstimate < CONTEXT_TOKEN_THRESHOLD || messages.length <= KEEP_RECENT_MESSAGES) {
+  if (messages.length <= KEEP_RECENT_MESSAGES) {
     return { messages, summary: existingSummary || '', compressedCount: 0 }
   }
 
@@ -163,7 +163,18 @@ export async function summarize(model: any, messages: ModelMessage[], existingSu
   const toCompress = messages.slice(0, alignedIdx)
   const toKeep = messages.slice(alignedIdx)
 
-  const conversationText = toCompress.map((msg) => {
+  // 旧摘要已通过 existingSummary 单独传入，不再把上一次注入的摘要消息重复加入新对话。
+  const firstMessage = toCompress[0]
+  const hasInjectedSummary = Boolean(
+    existingSummary
+    && firstMessage?.role === 'user'
+    && typeof firstMessage.content === 'string'
+    && firstMessage.content.startsWith(SUMMARY_MESSAGE_PREFIX),
+  )
+  const newMessagesToCompress = hasInjectedSummary ? toCompress.slice(1) : toCompress
+
+  // 把结构化模型消息转成带角色标记的文本，作为摘要模型的输入。
+  const conversationText = newMessagesToCompress.map((msg) => {
     const content = typeof msg.content === 'string'
       ? msg.content
       : Array.isArray(msg.content)
@@ -177,6 +188,7 @@ export async function summarize(model: any, messages: ModelMessage[], existingSu
     return { messages, summary: existingSummary || '', compressedCount: 0 }
   }
 
+  // 后续压缩通过“已有摘要 + 新增旧对话”生成新摘要，避免重新总结全部历史。
   const userPrompt = existingSummary
     ? `## 已有摘要（上一次压缩的结果）\n\n${existingSummary}\n\n## 需要压缩的新对话\n\n${conversationText}`
     : conversationText
@@ -188,9 +200,10 @@ export async function summarize(model: any, messages: ModelMessage[], existingSu
       prompt: userPrompt,
     })
 
+    // 摘要以普通模型消息注入上下文，与最近的完整对话共同传给主模型。
     const summaryMessage: ModelMessage = {
       role: 'user',
-      content: `[以下是之前对话的压缩摘要]\n\n${summary}\n\n[摘要结束，以下是最近的对话]`,
+      content: `${SUMMARY_MESSAGE_PREFIX}\n\n${summary}\n\n[摘要结束，以下是最近的对话]`,
     }
 
     const newMessages: ModelMessage[] = [summaryMessage, ...toKeep]
