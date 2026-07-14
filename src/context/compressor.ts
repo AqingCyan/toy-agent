@@ -39,6 +39,8 @@ const CLEARABLE_TOOLS = new Set([
   'list_directory',
   'edit_file',
   'write_file',
+  'web_search',
+  'get_weather',
 ])
 /** 微压缩时原样保留的最近结构化工具消息数量。 */
 const KEEP_RECENT_TOOL_RESULTS = 3

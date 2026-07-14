@@ -40,7 +40,7 @@ const kimi = createOpenAI({
 const model = kimi.chat('kimi-k2.6')
 
 /** 触发上下文分层压缩的 Token 估算阈值。 */
-const COMPACTION_TOKEN_THRESHOLD = 4000
+const COMPACTION_TOKEN_THRESHOLD = 1000
 
 /** 一次压缩检查后的上下文状态和统计。 */
 interface CompactionCheckResult {
